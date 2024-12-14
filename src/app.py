@@ -1,7 +1,6 @@
 # src/app.py
 
 import streamlit as st
-import face_recognition
 import cv2
 import numpy as np
 import pickle
@@ -11,23 +10,35 @@ import os
 # Установка конфигурации страницы должна быть первой командой Streamlit
 st.set_page_config(page_title="Распознавание лиц Energo University", layout="wide")
 
-# Загрузка кодировок лиц с использованием нового декоратора кэша
-@st.cache_data
-def load_encodings(encodings_path='encodings.pkl'):
-    try:
-        with open(encodings_path, 'rb') as f:
-            data = pickle.load(f)
-        return data['encodings'], data['names']
-    except FileNotFoundError:
-        st.error(f"Файл кодировок '{encodings_path}' не найден. Убедитесь, что он существует и путь указан правильно.")
-        return [], []
-    except Exception as e:
-        st.error(f"Произошла ошибка при загрузке кодировок: {e}")
-        return [], []
+# Загрузка модели и меток
+@st.cache_resource
+def load_model(model_path='encodings.yml', labels_path='labels.pkl'):
+    if not os.path.exists(model_path):
+        st.error(f"Файл модели '{model_path}' не найден.")
+        return None, {}
+    if not os.path.exists(labels_path):
+        st.error(f"Файл меток '{labels_path}' не найден.")
+        return None, {}
 
-known_face_encodings, known_face_names = load_encodings()
+    # Загрузка модели
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.read(model_path)
+
+    # Загрузка словаря меток
+    with open(labels_path, 'rb') as f:
+        label_dict = pickle.load(f)
+
+    # Инвертирование словаря для получения имен по меткам
+    label_dict_inv = {v: k for k, v in label_dict.items()}
+
+    return recognizer, label_dict_inv
+
+recognizer, label_dict = load_model()
 
 def main():
+    if recognizer is None or not label_dict:
+        st.stop()
+
     # Загрузка логотипа
     try:
         logo = Image.open("assets/logo_daukeev.png")
@@ -77,15 +88,20 @@ def main():
                 st.image(captured_image, caption="Исходное изображение", use_container_width=True)
 
                 # Конвертация изображения в формат, пригодный для обработки
-                image = face_recognition.load_image_file(captured_image)
-                face_locations = face_recognition.face_locations(image)
-                face_encodings = face_recognition.face_encodings(image, face_locations)
+                image = Image.open(captured_image).convert('RGB')
+                open_cv_image = np.array(image)
+                open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2GRAY)
 
-                if not face_locations:
+                # Детектирование лиц
+                face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+
+                if len(faces) == 0:
                     st.warning("Лица не обнаружены на изображении.")
                 else:
                     # Создание объекта PIL для рисования
-                    pil_image = Image.fromarray(image)
+                    pil_image = Image.fromarray(cv2.cvtColor(open_cv_image, cv2.COLOR_BGR2RGB))
                     draw = ImageDraw.Draw(pil_image)
 
                     # Загрузка кастомного шрифта
@@ -100,34 +116,31 @@ def main():
                         st.error(f"Произошла ошибка при загрузке шрифта: {e}")
                         font = ImageFont.load_default()
 
-                    # Установка максимальной дистанции для определения точности
-                    max_distance = 0.6  # Соответствует стандартной толерантности face_recognition
+                    # Параметры для рисования
+                    font_color = (255, 255, 255)  # Белый цвет текста
 
-                    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                        # Сравнение с известными лицами
-                        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
-                        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
-                        best_match_index = np.argmin(face_distances)
-                        name = "Неизвестно"
-                        confidence = 0  # Изначально 0%
+                    for (x, y, w, h) in faces:
+                        face_roi = gray[y:y+h, x:x+w]
+                        face_roi_resized = cv2.resize(face_roi, (200, 200))  # Приведение к размеру, ожидаемому моделью
 
-                        if matches[best_match_index]:
-                            name = known_face_names[best_match_index]
-                            # Вычисление процента точности
-                            distance = face_distances[best_match_index]
-                            confidence = max(0, min(100, int((1 - distance / max_distance) * 100)))
-                            label = f"Сотрудник Energo University: {name} ({confidence}%)"
-                            color = (0, 255, 0)  # Зеленый
+                        # Распознавание лица
+                        label, confidence = recognizer.predict(face_roi_resized)
+                        if label in label_dict:
+                            name = label_dict[label]
+                            confidence_score = max(0, min(100, int(100 - confidence)))
+                            label_text = f"Сотрудник Energo University: {name} ({confidence_score}%)"  # Изменено здесь
+                            color = (0, 255, 0)  # Зеленый для известных лиц
                         else:
-                            label = f"Неизвестно ({0}%)"
-                            color = (255, 0, 0)  # Красный
+                            label_text = "Неизвестно"
+                            confidence_score = 0
+                            color = (255, 0, 0)  # Красный для неизвестных лиц
 
                         # Рисование прямоугольника вокруг лица
-                        draw.rectangle(((left, top), (right, bottom)), outline=color, width=2)
+                        draw.rectangle(((x, y), (x + w, y + h)), outline=color, width=2)
 
                         # Измерение размера текста
                         try:
-                            bbox = font.getbbox(label)
+                            bbox = font.getbbox(label_text)
                             text_width = bbox[2] - bbox[0]
                             text_height = bbox[3] - bbox[1]
                         except AttributeError:
@@ -137,10 +150,10 @@ def main():
                             text_height = 0
 
                         # Рисование фона для текста
-                        draw.rectangle(((left, bottom - text_height - 10), (left + text_width + 12, bottom)), fill=color, outline=color)
+                        draw.rectangle(((x, y + h - text_height - 10), (x + text_width + 12, y + h)), fill=color)
 
                         # Добавление текста под прямоугольником
-                        draw.text((left + 6, bottom - text_height - 5), label, fill=(255, 255, 255, 255), font=font)
+                        draw.text((x + 6, y + h - text_height - 5), label_text, fill=font_color, font=font)
 
                     # Удаление объекта рисования
                     del draw
